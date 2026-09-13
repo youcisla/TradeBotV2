@@ -146,7 +146,9 @@ class PaperBroker:
 
     def __init__(self, starting_balance: float = 1_000.0) -> None:
         self.balance = starting_balance
-        self.realised = 0.0
+        self.total_realised = 0.0
+        self._by_ticket: dict[int, float] = {}
+        self._exit: dict[int, str] = {}
         self._positions: dict[int, _Open] = {}
         self._next_ticket = 1
         self._symbol_map: dict[str, str] = {}
@@ -253,8 +255,33 @@ class PaperBroker:
     def _realise(self, position: _Open, volume: float, price: float) -> None:
         direction = 1.0 if position.direction.is_buy else -1.0
         move = volume * (price - position.entry_price) * CONTRACT_SIZE * direction
-        self.realised += move
+        self.total_realised += move
         self.balance = round(self.balance + move, 4)
+        # Per-ticket as well as the running total: a scale-out realises several
+        # times for one position, and the ledger wants one number for the trade.
+        self._by_ticket[position.ticket] = round(
+            self._by_ticket.get(position.ticket, 0.0) + move, 4
+        )
+
+    def realised(self, ticket: int) -> float | None:
+        """Paper counterpart of the broker's deal history.
+
+        Exists so the replay drives the *same* archiving path as live trading.
+        Without it ``Bot._archive`` would read a missing method and the replay
+        would silently produce no ledger, which is the one artefact the whole
+        exercise is for.
+        """
+        return self._by_ticket.get(ticket)
+
+    def exit_reason(self, ticket: int) -> str | None:
+        """Why the simulated position closed — the counterpart of the broker's.
+
+        The bot only learns a simulated position is gone when reconcile runs, by
+        which point "it stopped out" and "it hit its target" look identical.
+        Remembering which one happened is what keeps the ledger informative
+        rather than 400 rows of "MANUAL".
+        """
+        return self._exit.get(ticket)
 
     def mark(self, symbol: str, price: float, spread: float = 0.0,
              at: datetime | None = None) -> None:
@@ -267,14 +294,21 @@ class PaperBroker:
             if position.symbol == symbol:
                 position.current_price = price
 
-    def hit_levels(self, bar: Candle) -> list[tuple[int, str]]:
-        """Resolve stops and targets against this bar.
+    def hit_levels(self, symbol: str, bar: Candle) -> list[tuple[int, str]]:
+        """Resolve *symbol*'s stops and targets against this bar.
+
+        A bar belongs to one instrument, so only that instrument's positions
+        may be resolved against it.  Testing every position against whichever
+        bar happened to be loaded compared EURUSD levels to GBPUSD prices and
+        retired positions at prices they never traded at.
 
         Assumes the stop is reached first when a bar spans both — the same
         pessimistic rule the measurement engine uses.
         """
         events: list[tuple[int, str]] = []
         for ticket, position in list(self._positions.items()):
+            if position.symbol != symbol:
+                continue
             is_buy = position.direction.is_buy
             stop_hit = (bar.low <= position.stop_loss) if is_buy \
                 else (bar.high >= position.stop_loss)
@@ -286,10 +320,12 @@ class PaperBroker:
             if stop_hit:
                 self._realise(position, position.volume, position.stop_loss)
                 events.append((ticket, "stop"))
+                self._exit[ticket] = "stop"
                 self._positions.pop(ticket, None)
             elif target_hit:
                 self._realise(position, position.volume, position.take_profit)
                 events.append((ticket, "target"))
+                self._exit[ticket] = "target"
                 self._positions.pop(ticket, None)
             else:
                 position.current_price = bar.close
@@ -346,22 +382,21 @@ def run_replay(
             break
 
         data.seek(index)
-        bar = series[symbols[0]][index]
 
-        # 1. Mark to this bar's close, so the simulator can price fills and the
-        #    bot sees the same world it would see live.
+        # 1. Mark each symbol to its own bar's close, so the simulator can price
+        #    fills and the bot sees the same world it would see live; then
+        # 2. resolve that symbol's stops and targets against that same bar.
         for symbol in symbols:
             symbol_series = series[symbol]
-            if index < len(symbol_series):
-                candle = symbol_series[index]
-                paper.mark(symbol, candle.close, candle.spread, candle.timestamp)
-
-        # 2. Resolve stops and targets against this bar.
-        for _ticket, kind in paper.hit_levels(bar):
-            if kind == "stop":
-                result.stopped += 1
-            else:
-                result.targeted += 1
+            if index >= len(symbol_series):
+                continue
+            candle = symbol_series[index]
+            paper.mark(symbol, candle.close, candle.spread, candle.timestamp)
+            for _ticket, kind in paper.hit_levels(symbol, candle):
+                if kind == "stop":
+                    result.stopped += 1
+                else:
+                    result.targeted += 1
 
         # 3. Let the REAL bot decide, against the simulated broker.
         opened_before = paper.open_count()
@@ -432,7 +467,19 @@ def _self_check() -> None:
     paper2 = PaperBroker()
     paper2.mark("EURUSD", 1.1000)
     paper2.place("EURUSD", Direction.BUY, 0.01, stop_loss=1.0950, take_profit=1.1050)
-    assert [k for _t, k in paper2.hit_levels(straddle)] == ["stop"]
+    assert [k for _t, k in paper2.hit_levels("EURUSD", straddle)] == ["stop"]
+    # The reason has to outlive the position: the bot only learns it is gone at
+    # the next reconcile, long after the bar that closed it.
+    assert paper2.exit_reason(1) == "stop", paper2.exit_reason(1)
+
+    # A bar resolves only its own instrument.  Resolving every position against
+    # symbols[0]'s bar compared GBPUSD stops to EURUSD prices and produced a
+    # +362% replay that the measurement engine flatly disagreed with.
+    paper2.mark("GBPUSD", 1.3500)
+    gbp = paper2.place("GBPUSD", Direction.SELL, 0.01, stop_loss=1.3550, take_profit=1.3400)
+    assert gbp.success
+    assert paper2.hit_levels("EURUSD", straddle) == [], "EURUSD bar resolved a GBPUSD position"
+    assert paper2.open_count() == 1, "the GBPUSD position must still be open"
 
     # P&L arithmetic: 1 lot of EURUSD moving 100 pips is $1000.  The stop must
     # sit AWAY from entry — a zero-distance stop is hit by the same bar's low —
@@ -442,7 +489,7 @@ def _self_check() -> None:
     paper3.place("EURUSD", Direction.BUY, 1.0, stop_loss=0.9900, take_profit=1.0100)
     assert paper3.balance == 1_000.0, "an open position must not move the balance"
     profit_bar = Candle(datetime(2026, 1, 7, 1, tzinfo=UTC), 1.0000, 1.0100, 1.0000, 1.0100)
-    assert [k for _t, k in paper3.hit_levels(profit_bar)] == ["target"]
+    assert [k for _t, k in paper3.hit_levels("EURUSD", profit_bar)] == ["target"]
     assert abs(paper3.balance - 2_000.0) < 1e-6, paper3.balance
 
     print("replay.py self-check: OK")

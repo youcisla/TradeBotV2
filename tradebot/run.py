@@ -44,6 +44,11 @@ STRATEGIES = {
 
 TP_FRACTIONS = (0.40, 0.30, 0.30)
 
+# The broker's own words for why a position ended, mapped onto the ledger's
+# vocabulary.  Anything unrecognised keeps the caller's outcome rather than
+# being guessed at.
+_EXIT_OUTCOMES: dict[str, Outcome] = {"stop": Outcome.SL, "target": Outcome.TP}
+
 
 class Bot:
     """Single-process, single-account trading loop."""
@@ -185,9 +190,7 @@ class Bot:
                     "Reconcile: %s ticket %d is gone from the broker — marking closed",
                     trade.symbol, ticket,
                 )
-                trade.outcome = Outcome.MANUAL
-                trade.closed_at = datetime.now(UTC)
-                self.trades.pop(ticket, None)
+                self._archive(trade, Outcome.MANUAL)
 
         # The broker holds it; we do not know about it → adopt it, but never
         # invent targets for a position whose plan we cannot reconstruct.
@@ -205,6 +208,7 @@ class Bot:
                     volume=position.volume,
                     entry_price=position.entry_price,
                     stop_loss=position.stop_loss,
+                    initial_stop_loss=position.stop_loss,
                     opened_at=datetime.now(UTC),
                     strategy="adopted",
                 )
@@ -278,9 +282,67 @@ class Bot:
                         )
 
             if trade.closed_fraction >= 0.999:
-                trade.outcome = Outcome.TP
-                trade.closed_at = datetime.now(UTC)
-                self.trades.pop(position.ticket, None)
+                self._archive(trade, Outcome.TP)
+
+    # ── closure ──────────────────────────────────────────────────────────────
+
+    def _outcome_from_broker(self, ticket: int) -> Outcome | None:
+        """Ask the broker why the position ended before falling back to the caller.
+
+        A stop-out and a target hit are the two facts that decide whether the
+        strategy works, and once the position is gone they are indistinguishable
+        unless the broker's own record is consulted.  A broker that cannot say
+        returns None and the caller's outcome stands.
+        """
+        ask = getattr(self.broker, "exit_reason", None)
+        if ask is None:
+            return None
+        try:
+            return _EXIT_OUTCOMES.get(ask(ticket) or "")
+        except Exception:                                  # noqa: BLE001
+            logger.exception("exit_reason failed for ticket %d", ticket)
+            return None
+
+    def _archive(self, trade: Trade, outcome: Outcome) -> None:
+        """Retire a finished trade: book its result, then keep the record.
+
+        Both closure paths land here — the target sequence completing, and the
+        broker reporting a position we still believed was open — so the ledger
+        cannot be written by one and forgotten by the other.
+
+        The result comes from the broker's deal history, never from arithmetic
+        on prices.  A computed figure would omit spread, swap and commission,
+        which is exactly the part of the outcome that decides whether the
+        strategy works at all.
+        """
+        trade.outcome = self._outcome_from_broker(trade.ticket) or outcome
+        trade.closed_at = datetime.now(UTC)
+
+        realised = self.broker.realised(trade.ticket)
+        if realised is None:
+            # Keep it anyway.  An unverifiable result is still a datapoint, and
+            # dropping it would bias the ledger toward the trades that happened
+            # to settle cleanly.
+            logger.warning(
+                "No realised P&L for %s ticket %d — archived unrecorded",
+                trade.symbol, trade.ticket,
+            )
+            ACTIVITY.add(
+                "closed", f"{trade.outcome} {trade.symbol} (P&L unknown)", trade.symbol
+            )
+        else:
+            trade.pnl = realised
+            trade.pnl_recorded = True
+            logger.info(
+                "Closed %s ticket %d: %s, net %+.2f",
+                trade.symbol, trade.ticket, trade.outcome, realised,
+            )
+            ACTIVITY.add(
+                "closed", f"{trade.outcome} {trade.symbol} {realised:+.2f}", trade.symbol
+            )
+
+        self.state.append_closed(trade)
+        self.trades.pop(trade.ticket, None)
 
     # ── signal generation ────────────────────────────────────────────────────
 
@@ -394,6 +456,7 @@ class Bot:
             volume=filled,
             entry_price=result.fill_price or signal.entry_price,
             stop_loss=signal.stop_loss,
+            initial_stop_loss=signal.stop_loss,
             take_profit_1=signal.take_profit_1,
             take_profit_2=signal.take_profit_2,
             take_profit_3=signal.take_profit_3,
@@ -445,6 +508,23 @@ def _self_check() -> None:
         bot._reconcile(positions=[orphan])
         assert 7 in bot.trades and bot.trades[7].strategy == "adopted"
         assert abs(bot.trades[7].volume - 0.03) < 1e-12
+
+        # The broker's own record of why a position ended beats the caller's
+        # guess, so a stop-out and a target hit stay distinguishable in the
+        # ledger instead of both reading "MANUAL".
+        class _Speaks:
+            def exit_reason(self, ticket: int) -> str | None:
+                return {1: "stop", 2: "target"}.get(ticket)
+
+        class _Mute:
+            pass
+
+        bot.broker = _Speaks()
+        assert bot._outcome_from_broker(1) is Outcome.SL
+        assert bot._outcome_from_broker(2) is Outcome.TP
+        assert bot._outcome_from_broker(99) is None, "an unknown exit must not be guessed"
+        bot.broker = _Mute()
+        assert bot._outcome_from_broker(1) is None, "a broker that cannot say must not be forced"
 
         print("run.py self-check: OK")
 

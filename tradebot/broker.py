@@ -157,6 +157,62 @@ class Broker:
             return 0.0, 0.0
         return float(info.balance), float(info.equity)
 
+    def realised(self, ticket: int) -> float | None:
+        """Net realised result for a position, from the broker's deal history.
+
+        Sums every deal attached to the position — both legs of a scale-out and
+        the commission on each — so a trade closed in thirds reports one true
+        number instead of only the last partial's profit.
+
+        ``None`` means the history could not be read, which is **not** zero.
+        Recording a fabricated 0.0 would quietly turn a loss into a flat trade,
+        and a ledger that loses its losers is worse than no ledger.
+        """
+        deals = mt5.history_deals_get(position=ticket)
+        if deals is None:
+            logger.warning("No deal history for position %d: %s", ticket, mt5.last_error())
+            return None
+
+        net = 0.0
+        matched = 0
+        for deal in deals:
+            # Re-check the position id: if the broker build ignores the filter,
+            # summing anyway would fold the whole account's history into one
+            # trade.  Silent, and catastrophic.
+            if int(getattr(deal, "position_id", 0) or 0) != ticket:
+                continue
+            matched += 1
+            net += float(getattr(deal, "profit", 0.0) or 0.0)
+            net += float(getattr(deal, "swap", 0.0) or 0.0)
+            net += float(getattr(deal, "commission", 0.0) or 0.0)
+
+        if not matched:
+            logger.warning("Deal history for %d held no matching deals", ticket)
+            return None
+        return round(net, 4)
+
+    def exit_reason(self, ticket: int) -> str | None:
+        """Why the position ended, when the broker recorded it.
+
+        MT5 tags the closing deal with a reason, so a stop or target touch is
+        distinguishable from a hand close or an expert call.  Without it every
+        closure reads the same, and the ledger cannot tell a strategy result
+        from an unexplained exit.
+        """
+        deals = mt5.history_deals_get(position=ticket)
+        if not deals:
+            return None
+        for deal in reversed(deals):
+            if int(getattr(deal, "entry", -1)) != mt5.DEAL_ENTRY_OUT:
+                continue
+            reason = int(getattr(deal, "reason", -1) or -1)
+            if reason == mt5.DEAL_REASON_SL:
+                return "stop"
+            if reason == mt5.DEAL_REASON_TP:
+                return "target"
+            return None
+        return None
+
     # ── order entry ──────────────────────────────────────────────────────────
 
     def place(

@@ -33,12 +33,14 @@ LOG_DATEFMT = "%H:%M:%S"
 SELF_CHECK_MODULES = (
     "tradebot.measure",
     "tradebot.strategy",
+    "tradebot.symbols",
     "tradebot.broker",
     "tradebot.risk",
     "tradebot.state",
     "tradebot.intake",
     "tradebot.supervise",
     "tradebot.replay",
+    "tradebot.agents",
     "tradebot.dashboard",
     "tradebot.run",
 )
@@ -287,6 +289,133 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     return bot.run()
 
 
+def _write_symbols(path: Path, bases: list[str]) -> Path:
+    """Rewrite the ``SYMBOLS=`` line, leaving every other line alone.
+
+    ``.env`` holds the broker credentials, so this touches one line and writes
+    atomically.  A whole-file rewrite would be one bug away from destroying a
+    live password.
+    """
+    import os
+
+    line = "SYMBOLS=" + ",".join(bases)
+    existing = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    out: list[str] = []
+    replaced = False
+    for row in existing:
+        if row.strip().startswith("SYMBOLS="):
+            out.append(line)
+            replaced = True
+        else:
+            out.append(row)
+    if not replaced:
+        out.append(line)
+
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def cmd_symbols(args: argparse.Namespace) -> int:
+    """Rank the broker's whole symbol list and show the cheapest per category."""
+    from tradebot.config import load_settings
+    from tradebot.data import MarketData
+
+    settings = load_settings()
+    settings.validate(require_broker=True)
+
+    data = MarketData(settings)
+    if not data.connect():
+        logger.error("MT5 is required to scan the symbol list")
+        return 1
+    try:
+        universe = data.discover(
+            per_category=args.per_category, subscribe=not args.no_subscribe
+        )
+    finally:
+        data.disconnect()
+
+    if not universe:
+        logger.error("no tradeable instruments discovered")
+        return 1
+
+    bases: list[str] = []
+    for category, items in universe.items():
+        print()
+        print(f"{category}  ({len(items)})")
+        print("-" * 78)
+        for item in items:
+            bases.append(item.base)
+            print(
+                f"  {item.base:<10} {item.group:<20} "
+                f"{item.price:>12.5f}  spread {item.spread:<10.5f} "
+                f"{item.relative_cost * 100:.4f}%"
+            )
+
+    print()
+    print(f"{len(bases)} symbol(s) across {len(universe)} category/ies")
+    print()
+    print("SYMBOLS=" + ",".join(bases))
+    print()
+    if args.write:
+        path = _write_symbols(REPO_ROOT / ".env", bases)
+        print(f"Updated {path} — only the SYMBOLS line changed.")
+    else:
+        print("Copy that line into .env, or re-run with --write.")
+    return 0
+
+
+def cmd_agents(args: argparse.Namespace) -> int:
+    """Run the agent roster once and write a report.
+
+    Safe to run while the bot is live: agents observe, the trading loop
+    decides, and no agent can reach the broker.
+    """
+    from tradebot.agents import (
+        Analyst,
+        Coordinator,
+        Sentinel,
+        build_context,
+        write_report,
+    )
+    from tradebot.config import load_settings
+    from tradebot.data import MarketData
+    from tradebot.state import StateStore
+
+    settings = load_settings()
+    # Deliberately NOT validate(require_broker=True).  The analyst reads a file
+    # and the sentinel degrades honestly, so this command still reports when the
+    # broker is unreachable — which is precisely when a diagnosis is wanted.
+    settings.validate(require_broker=False)
+
+    data = MarketData(settings)
+    connected = data.connect() if settings.broker.configured else False
+    try:
+        if not connected:
+            logger.warning("MT5 unavailable — the sentinel will report that plainly")
+        store = StateStore(settings.state_dir)
+        coordinator = Coordinator((Analyst(), Sentinel(settings)))
+        report = coordinator.run(
+            build_context(
+                coordinator.role,
+                trades=store.load_trades(),
+                closed=store.load_closed(),
+                market=data if connected else None,
+            )
+        )
+    finally:
+        if connected:
+            data.disconnect()
+
+    print()
+    print(report.body)
+    path = write_report(report, settings.state_dir / "reports")
+    print()
+    print(f"Written to {path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="main.py", description="TradeBot")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -333,6 +462,18 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--start", type=int, default=200, help="first bar index to act on")
     replay.add_argument("--stride", type=int, default=1, help="bars advanced per step")
     replay.set_defaults(func=cmd_replay)
+
+    symbols_cmd = sub.add_parser("symbols", help="rank the broker's symbol list by cost")
+    symbols_cmd.add_argument("--per-category", type=int, default=10,
+                             help="how many to keep from each category")
+    symbols_cmd.add_argument("--write", action="store_true",
+                             help="rewrite the SYMBOLS line in .env")
+    symbols_cmd.add_argument("--no-subscribe", action="store_true",
+                             help="only read symbols the terminal already prices")
+    symbols_cmd.set_defaults(func=cmd_symbols)
+
+    agents_cmd = sub.add_parser("agents", help="run the agent roster and write a report")
+    agents_cmd.set_defaults(func=cmd_agents)
 
     sub.add_parser("stop", help="set the kill switch").set_defaults(func=cmd_stop)
     sub.add_parser("clear", help="clear the kill switch").set_defaults(func=cmd_clear)

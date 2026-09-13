@@ -207,6 +207,11 @@ class Trade:
     volume: float
     entry_price: float
     stop_loss: float
+    # The stop as first placed.  ``stop_loss`` is a live field — the bot moves it
+    # to breakeven once the first target is banked — so measuring risk from it
+    # after that point measures nothing, and silently drops every trade that did
+    # well.  1R has to be fixed at entry and never move again.
+    initial_stop_loss: float = 0.0
     take_profit_1: float = 0.0
     take_profit_2: float = 0.0
     take_profit_3: float = 0.0
@@ -214,6 +219,11 @@ class Trade:
     outcome: Outcome = Outcome.OPEN
     closed_at: datetime | None = None
     pnl: float = 0.0
+    # Whether ``pnl`` came from the broker or is merely a default.  Without this
+    # the two are indistinguishable: an unreadable deal history would record
+    # 0.0 and read back as a break-even trade, quietly deleting a loss from the
+    # statistics.  Unknown and zero must never collapse into each other.
+    pnl_recorded: bool = False
     strategy: str = ""
     spread_at_entry: float = 0.0
     # Fraction of the position already taken off at each target.

@@ -13,6 +13,7 @@ strict; the session survives.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -20,7 +21,13 @@ import MetaTrader5 as _mt5
 
 from tradebot.config import Settings
 from tradebot.domain import Candle
-from tradebot.symbols import BROKER_SUFFIXES
+from tradebot.symbols import (
+    BROKER_SUFFIXES,
+    Instrument,
+    base_symbol,
+    category_of,
+    rank_universe,
+)
 
 mt5 = cast(Any, _mt5)
 
@@ -36,6 +43,16 @@ TIMEFRAMES: dict[str, int] = {
     "D1": mt5.TIMEFRAME_D1,
     "W1": mt5.TIMEFRAME_W1,
 }
+
+# A freshly subscribed symbol carries no tick until the terminal's feed catches
+# up.  Two seconds is measured, not guessed: reading at zero seconds saw 161
+# priced instruments where reading at two saw 1,021.
+SETTLE_SECONDS = 2.0
+
+
+def _quote(info: Any) -> float:
+    """Price carried on a SymbolInfo snapshot, or 0.0 when it has none."""
+    return float(getattr(info, "bid", 0.0) or 0.0) or float(getattr(info, "ask", 0.0) or 0.0)
 
 
 class MarketData:
@@ -117,6 +134,93 @@ class MarketData:
 
         logger.warning("Symbol not resolvable on this broker: %s", text)
         return None
+
+    # ── universe ─────────────────────────────────────────────────────────────
+
+    def discover(
+        self, per_category: int = 10, *, subscribe: bool = True
+    ) -> dict[str, list[Instrument]]:
+        """Rank every instrument the broker offers by cost to trade.
+
+        The trap this exists to avoid: MT5 returns **no price at all** for a
+        symbol nobody has subscribed to in Market Watch, so filtering on "has a
+        price" quietly reduces the broker's 1,109-instrument book to whatever 63
+        the terminal happened to have open.  Discovery would then report a
+        universe shaped by the Market Watch panel rather than by the broker.
+
+        Subscribing is not enough on its own either — a freshly subscribed
+        symbol has no tick until the feed catches up, and reading immediately
+        reported 161 instruments as tradeable when the real figure is 1,021.
+        Hence the settle pause.
+
+        Anything that does not survive ranking is unsubscribed again.  Only
+        symbols this function subscribed are handed back, so the operator's own
+        Market Watch is left exactly as it was found.
+        """
+        infos = mt5.symbols_get()
+        if infos is None:
+            logger.error("symbols_get failed: %s", mt5.last_error())
+            return {}
+
+        # Trade-disabled symbols are dropped *before* ranking: the cheapest
+        # instrument in a category is meaningless if it cannot be traded, and it
+        # would silently displace a usable one.
+        tradeable = [
+            s
+            for s in infos
+            if getattr(s, "trade_mode", 0) == mt5.SYMBOL_TRADE_MODE_FULL
+            and float(getattr(s, "point", 0.0) or 0.0) > 0
+        ]
+
+        borrowed: list[str] = []
+        if subscribe:
+            for info in tradeable:
+                if _quote(info) > 0 or getattr(info, "visible", False):
+                    continue
+                if mt5.symbol_select(str(info.name), True):
+                    borrowed.append(str(info.name))
+            if borrowed:
+                time.sleep(SETTLE_SECONDS)
+
+        # One fresh snapshot rather than a symbol_info call per symbol: the
+        # same data, one IPC round trip instead of a thousand.
+        fresh = {str(s.name): s for s in (mt5.symbols_get() or ())}
+
+        found: list[Instrument] = []
+        for info in tradeable:
+            name = str(info.name)
+            current = fresh.get(name, info)
+            price = _quote(current) or _quote(info)
+            if price <= 0:
+                continue
+            category, group = category_of(getattr(info, "path", "") or "")
+            found.append(
+                Instrument(
+                    name=name,
+                    base=base_symbol(name),
+                    category=category,
+                    group=group,
+                    price=price,
+                    spread=float(getattr(current, "spread", 0) or 0)
+                    * float(getattr(info, "point", 0.0) or 0.0),
+                )
+            )
+
+        universe = rank_universe(found, per_category=per_category)
+
+        kept = {instrument.name for items in universe.values() for instrument in items}
+        returned = 0
+        for name in borrowed:
+            if name not in kept:
+                mt5.symbol_select(name, False)
+                returned += 1
+
+        logger.info(
+            "Discovered %d priced instrument(s) across %d category/ies "
+            "(%d subscribed to read, %d handed back)",
+            len(found), len(universe), len(borrowed), returned,
+        )
+        return universe
 
     # ── candles ──────────────────────────────────────────────────────────────
 

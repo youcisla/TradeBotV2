@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 STOP_FILE = "STOP"
 HEARTBEAT_FILE = "heartbeat.json"
 TRADES_FILE = "trades.json"
+# Finished trades, one JSON object per line.  Kept separate from TRADES_FILE
+# because that file describes what the broker currently holds and is rewritten
+# every iteration; this one is history and is only ever appended to.
+CLOSED_FILE = "closed.jsonl"
 
 
 def _atomic_write(path: Path, payload: dict[str, Any], attempts: int = 5) -> None:
@@ -57,6 +61,53 @@ def _read_json(path: Path) -> dict[str, Any] | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:                               # noqa: BLE001
         logger.error("State file %s unreadable: %s", path, exc)
+        return None
+
+
+def _trade_row(trade: Trade) -> dict[str, Any]:
+    """One trade as a flat JSON object.
+
+    Shared by the live file and the ledger so that a field added to ``Trade``
+    cannot be persisted in one and silently dropped from the other.
+    """
+    row = asdict(trade)
+    row["direction"] = str(trade.direction)
+    row["outcome"] = str(trade.outcome)
+    row["opened_at"] = trade.opened_at.isoformat()
+    row["closed_at"] = trade.closed_at.isoformat() if trade.closed_at else None
+    if not trade.pnl_recorded:
+        # Unknown is not the same as zero, and the ledger has to be able to say
+        # which one it means.  A fabricated 0.0 reads as a break-even trade.
+        row["pnl"] = None
+    return row
+
+
+def _row_to_trade(row: dict[str, Any]) -> Trade | None:
+    try:
+        return Trade(
+            ticket=int(row["ticket"]),
+            symbol=str(row["symbol"]),
+            direction=Direction(row["direction"]),
+            volume=float(row["volume"]),
+            entry_price=float(row["entry_price"]),
+            stop_loss=float(row["stop_loss"]),
+            initial_stop_loss=float(row.get("initial_stop_loss", 0.0)),
+            take_profit_1=float(row.get("take_profit_1", 0.0)),
+            take_profit_2=float(row.get("take_profit_2", 0.0)),
+            take_profit_3=float(row.get("take_profit_3", 0.0)),
+            opened_at=datetime.fromisoformat(row["opened_at"]),
+            outcome=Outcome(row.get("outcome", "OPEN")),
+            closed_at=(
+                datetime.fromisoformat(row["closed_at"]) if row.get("closed_at") else None
+            ),
+            pnl=float(row.get("pnl") or 0.0),
+            pnl_recorded=row.get("pnl") is not None and bool(row.get("pnl_recorded", False)),
+            strategy=str(row.get("strategy", "")),
+            spread_at_entry=float(row.get("spread_at_entry", 0.0)),
+            closed_fraction=float(row.get("closed_fraction", 0.0)),
+        )
+    except Exception as exc:                               # noqa: BLE001
+        logger.error("Skipping unreadable trade record %s: %s", row.get("ticket"), exc)
         return None
 
 
@@ -138,17 +189,12 @@ class StateStore:
     # ── trades ───────────────────────────────────────────────────────────────
 
     def save_trades(self, trades: list[Trade]) -> None:
-        records = []
-        for t in trades:
-            row = asdict(t)
-            row["direction"] = str(t.direction)
-            row["outcome"] = str(t.outcome)
-            row["opened_at"] = t.opened_at.isoformat()
-            row["closed_at"] = t.closed_at.isoformat() if t.closed_at else None
-            records.append(row)
         _atomic_write(
             self.dir / TRADES_FILE,
-            {"saved_at": datetime.now(UTC).isoformat(), "trades": records},
+            {
+                "saved_at": datetime.now(UTC).isoformat(),
+                "trades": [_trade_row(t) for t in trades],
+            },
         )
 
     def load_trades(self) -> list[Trade]:
@@ -157,32 +203,43 @@ class StateStore:
             return []
         out: list[Trade] = []
         for row in raw.get("trades", []):
+            trade = _row_to_trade(row)
+            if trade is not None:
+                out.append(trade)
+        return out
+
+    # ── closed-trade ledger ──────────────────────────────────────────────────
+
+    def append_closed(self, trade: Trade) -> None:
+        """Archive one finished trade.  Append-only, one JSON object per line.
+
+        Rewriting the whole ledger on each close would lose records if two
+        processes appended at once, and would destroy every trade ever taken if
+        a single write were interrupted.  Appending one line can do neither: the
+        worst case is one torn line, and a torn line is skipped on read.
+        """
+        path = self.dir / CLOSED_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(_trade_row(trade)) + "\n")
+
+    def load_closed(self) -> list[Trade]:
+        """Every archived trade, oldest first.  A bad line is skipped, not fatal."""
+        path = self.dir / CLOSED_FILE
+        if not path.exists():
+            return []
+        out: list[Trade] = []
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
             try:
-                out.append(
-                    Trade(
-                        ticket=int(row["ticket"]),
-                        symbol=str(row["symbol"]),
-                        direction=Direction(row["direction"]),
-                        volume=float(row["volume"]),
-                        entry_price=float(row["entry_price"]),
-                        stop_loss=float(row["stop_loss"]),
-                        take_profit_1=float(row.get("take_profit_1", 0.0)),
-                        take_profit_2=float(row.get("take_profit_2", 0.0)),
-                        take_profit_3=float(row.get("take_profit_3", 0.0)),
-                        opened_at=datetime.fromisoformat(row["opened_at"]),
-                        outcome=Outcome(row.get("outcome", "OPEN")),
-                        closed_at=(
-                            datetime.fromisoformat(row["closed_at"])
-                            if row.get("closed_at") else None
-                        ),
-                        pnl=float(row.get("pnl", 0.0)),
-                        strategy=str(row.get("strategy", "")),
-                        spread_at_entry=float(row.get("spread_at_entry", 0.0)),
-                        closed_fraction=float(row.get("closed_fraction", 0.0)),
-                    )
-                )
+                row = json.loads(line)
             except Exception as exc:                       # noqa: BLE001
-                logger.error("Skipping unreadable trade record %s: %s", row.get("ticket"), exc)
+                logger.error("Skipping unreadable ledger line %d: %s", number, exc)
+                continue
+            trade = _row_to_trade(row)
+            if trade is not None:
+                out.append(trade)
         return out
 
 
@@ -221,6 +278,45 @@ def _self_check() -> None:
         assert loaded[0].outcome is Outcome.OPEN
         assert abs(loaded[0].volume - 0.05) < 1e-12
         assert abs(loaded[0].opened_at - trade.opened_at) < timedelta(seconds=1)
+
+        # The ledger must round-trip every field the statistics divide by.  A
+        # field written but not read back fails silently, and the statistic
+        # built on it is wrong in a way nothing else catches.
+        store.append_closed(
+            Trade(
+                ticket=124, symbol="EURUSD", direction=Direction.SELL, volume=0.02,
+                entry_price=1.1050, stop_loss=1.1100, initial_stop_loss=1.1100,
+                opened_at=datetime.now(UTC), outcome=Outcome.SL,
+                closed_at=datetime.now(UTC), pnl=-18.5, pnl_recorded=True,
+            )
+        )
+        # A stop trailed to breakeven, exactly as the bot leaves it after TP1.
+        store.append_closed(
+            Trade(
+                ticket=125, symbol="EURUSD", direction=Direction.BUY, volume=0.02,
+                entry_price=1.1050, stop_loss=1.1050, initial_stop_loss=1.1000,
+                opened_at=datetime.now(UTC), outcome=Outcome.TP,
+                closed_at=datetime.now(UTC), pnl=22.0, pnl_recorded=True,
+            )
+        )
+        # No recoverable result must survive as unknown, not as break-even.
+        store.append_closed(
+            Trade(
+                ticket=126, symbol="EURUSD", direction=Direction.BUY, volume=0.01,
+                entry_price=1.10, stop_loss=1.09, opened_at=datetime.now(UTC),
+                outcome=Outcome.MANUAL, closed_at=datetime.now(UTC),
+            )
+        )
+
+        archived = store.load_closed()
+        assert [t.ticket for t in archived] == [124, 125, 126], archived
+        assert archived[0].pnl_recorded and abs(archived[0].pnl + 18.5) < 1e-9
+        assert archived[0].outcome is Outcome.SL
+        assert abs(archived[1].initial_stop_loss - 1.1000) < 1e-9, (
+            "the initial stop was lost: 1R is unmeasurable without it"
+        )
+        assert abs(archived[1].stop_loss - 1.1050) < 1e-9, "the live stop must stay live"
+        assert archived[2].pnl_recorded is False, "unknown P&L became a recorded zero"
 
         store.request_stop("test")
         assert store.stop_requested() is True
