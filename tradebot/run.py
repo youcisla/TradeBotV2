@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 
 from tradebot.broker import Broker
 from tradebot.config import RISK, Settings, load_settings
+from tradebot.dashboard import ACTIVITY
 from tradebot.data import MarketData
 from tradebot.domain import Direction, Intent, Outcome, Position, Signal, Trade
 from tradebot.intake import INBOX
@@ -137,6 +138,10 @@ class Bot:
         # they face the same risk checks as anything generated internally.
         candidates = self._scan()
         candidates.extend(self._external_candidates())
+        ACTIVITY.add(
+            "scan",
+            f"{len(self.settings.symbols)} symbol(s) -> {len(candidates)} candidate(s)",
+        )
 
         opened = 0
         for signal in candidates:
@@ -253,6 +258,12 @@ class Bot:
                     index + 1, trade.symbol, position.ticket, volume,
                     trade.closed_fraction * 100,
                 )
+                ACTIVITY.add(
+                    "partial",
+                    f"TP{index + 1} closed {volume:.2f} lots "
+                    f"({trade.closed_fraction * 100:.0f}% banked)",
+                    trade.symbol,
+                )
 
                 if index == 0:
                     # First target banked: move the stop to entry so the rest of
@@ -339,12 +350,14 @@ class Bot:
         if not allowed:
             logger.info("Refused %s %s: %s", signal.direction, signal.symbol, reason)
             self._note_refusal(reason)
+            ACTIVITY.add("refuse", reason, signal.symbol)
             return False
 
         volume = position_size(signal, equity, RISK)
         if volume <= 0:
             logger.info("Refused %s: sizes to zero at this equity", signal.symbol)
             self._note_refusal("size rounds to zero")
+            ACTIVITY.add("refuse", "size rounds to zero", signal.symbol)
             return False
 
         if self.dry_run:
@@ -391,6 +404,11 @@ class Bot:
             "OPEN %s %s %.4f lots @ %.5f (sl %.5f)",
             signal.direction, signal.symbol, filled,
             result.fill_price or signal.entry_price, signal.stop_loss,
+        )
+        ACTIVITY.add(
+            "open",
+            f"{signal.direction} {filled:.2f} lots @ {result.fill_price or signal.entry_price:.5f}",
+            signal.symbol,
         )
         return True
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,11 +31,23 @@ HEARTBEAT_FILE = "heartbeat.json"
 TRADES_FILE = "trades.json"
 
 
-def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
+def _atomic_write(path: Path, payload: dict[str, Any], attempts: int = 5) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    os.replace(tmp, path)          # atomic on Windows and POSIX alike
+    # Atomic on POSIX, but on Windows os.replace raises Access Denied while any
+    # other handle holds the target — an antivirus scan, or another thread
+    # reading it.  Retrying briefly is right; failing silently is not, because a
+    # lost heartbeat looks exactly like a hung bot to the supervisor.
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                logger.error("Could not replace %s after %d attempts", path, attempts)
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:

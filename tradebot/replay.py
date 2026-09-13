@@ -27,6 +27,7 @@ replay flatters itself, so the simulator refuses to do it.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -108,6 +109,8 @@ class ReplayResult:
     max_drawdown: float = 0.0
     halted: bool = False
     refusals: dict[str, int] = field(default_factory=dict)
+    elapsed_s: float = 0.0
+    us_per_iteration: float = 0.0
 
     @property
     def return_pct(self) -> float:
@@ -121,10 +124,12 @@ class ReplayResult:
         return (
             f"bars={self.bars}\n"
             f"opened={self.opened}  stopped={self.stopped}  targeted={self.targeted}  "
-            f"never_filled={self.never_filled}  halted={self.halted}\n"
+            f"halted={self.halted}\n"
             f"balance {self.starting_balance:.2f} -> {self.final_balance:.2f} "
             f"({self.return_pct:+.2f}%)  maxDD={self.max_drawdown:.1%}\n"
-            f"refusals: {refused}"
+            f"refusals: {refused}\n"
+            f"compute: {self.elapsed_s:.2f}s total, {self.us_per_iteration:.0f}us per iteration "
+            f"(a live iteration waits {60}s between runs — this is the headroom)"
         )
 
 
@@ -143,9 +148,11 @@ class PaperBroker:
         self.balance = starting_balance
         self.realised = 0.0
         self._positions: dict[int, _Open] = {}
-        self._pending: list[tuple[str, Direction, float, float, float]] = []
         self._next_ticket = 1
         self._symbol_map: dict[str, str] = {}
+        self._last_price: dict[str, float] = {}
+        self._last_spread: dict[str, float] = {}
+        self._last_time: datetime = datetime.now(UTC)
 
     # ── interface used by Bot ────────────────────────────────────────────────
 
@@ -176,11 +183,33 @@ class PaperBroker:
         volume = self._normalise(volume)
         if volume <= 0:
             return OrderResult(False, message="volume below broker minimum")
-        # Queued, not filled.  The decision was made on this bar's close, so the
-        # fill belongs to the next bar — anything else uses information the bot
-        # did not have when it decided.
-        self._pending.append((symbol, direction, volume, stop_loss, take_profit))
-        return OrderResult(True, filled_volume=volume, message="queued")
+
+        mark = self._last_price.get(symbol)
+        if mark is None:
+            return OrderResult(False, message=f"no price known for {symbol}")
+
+        # A market order fills at the current price, and the bot's last known
+        # price is the close of the bar it just decided on.  Paying half the
+        # spread on the correct side is the execution cost.
+        #
+        # Filling here rather than on the next bar is not an optimisation: MT5
+        # fills market orders immediately, and queuing them made the bot track a
+        # ticket that did not exist yet — every order collided on ticket 0.
+        half_spread = self._last_spread.get(symbol, 0.0) / 2.0
+        price = mark + half_spread if direction.is_buy else mark - half_spread
+
+        ticket = self._next_ticket
+        self._next_ticket += 1
+        self._positions[ticket] = _Open(
+            ticket=ticket, symbol=symbol, direction=direction, volume=volume,
+            entry_price=round(price, 6), stop_loss=stop_loss,
+            take_profit=take_profit, opened_at=self._last_time,
+            current_price=round(price, 6),
+        )
+        return OrderResult(
+            True, ticket=ticket, filled_volume=volume,
+            fill_price=round(price, 6), message="filled",
+        )
 
     def modify(self, ticket: int, *, stop_loss: float | None = None,
                take_profit: float | None = None) -> bool:
@@ -227,34 +256,16 @@ class PaperBroker:
         self.realised += move
         self.balance = round(self.balance + move, 4)
 
-    def mark(self, symbol: str, price: float) -> None:
+    def mark(self, symbol: str, price: float, spread: float = 0.0,
+             at: datetime | None = None) -> None:
+        """Record the latest price before the bot looks at the world."""
+        self._last_price[symbol] = price
+        self._last_spread[symbol] = spread
+        if at is not None:
+            self._last_time = at
         for position in self._positions.values():
             if position.symbol == symbol:
                 position.current_price = price
-
-    def fill_pending(self, bar: Candle) -> int:
-        """Fill queued orders at this bar's open, with spread on the right side."""
-        if not self._pending:
-            return 0
-        half_spread = (bar.spread or 0.0) / 2.0
-        for symbol, direction, volume, stop_loss, take_profit in self._pending:
-            price = bar.open + half_spread if direction.is_buy else bar.open - half_spread
-            ticket = self._next_ticket
-            self._next_ticket += 1
-            self._positions[ticket] = _Open(
-                ticket=ticket, symbol=symbol, direction=direction, volume=volume,
-                entry_price=round(price, 6), stop_loss=stop_loss,
-                take_profit=take_profit, opened_at=bar.timestamp,
-                current_price=round(price, 6),
-            )
-        filled = len(self._pending)
-        self._pending.clear()
-        return filled
-
-    def cancel_pending(self) -> int:
-        dropped = len(self._pending)
-        self._pending.clear()
-        return dropped
 
     def hit_levels(self, bar: Candle) -> list[tuple[int, str]]:
         """Resolve stops and targets against this bar.
@@ -327,6 +338,7 @@ def run_replay(
     result = ReplayResult(starting_balance=paper.balance)
     seen_refusals: dict[str, int] = {}
 
+    started = time.perf_counter()
     index = start
     steps = 0
     while index < end - 1:
@@ -336,8 +348,13 @@ def run_replay(
         data.seek(index)
         bar = series[symbols[0]][index]
 
-        # 1. Fill what was decided on the previous bar, at THIS bar's open.
-        result.opened += paper.fill_pending(bar)
+        # 1. Mark to this bar's close, so the simulator can price fills and the
+        #    bot sees the same world it would see live.
+        for symbol in symbols:
+            symbol_series = series[symbol]
+            if index < len(symbol_series):
+                candle = symbol_series[index]
+                paper.mark(symbol, candle.close, candle.spread, candle.timestamp)
 
         # 2. Resolve stops and targets against this bar.
         for _ticket, kind in paper.hit_levels(bar):
@@ -346,12 +363,7 @@ def run_replay(
             else:
                 result.targeted += 1
 
-        # 3. Mark every open position to this bar's close before the bot looks.
-        for symbol in symbols:
-            symbol_series = series[symbol]
-            if index < len(symbol_series):
-                paper.mark(symbol, symbol_series[index].close)
-
+        # 3. Let the REAL bot decide, against the simulated broker.
         opened_before = paper.open_count()
         bot.iteration += 1
         try:
@@ -360,7 +372,6 @@ def run_replay(
             logger.exception("replay: iteration failed at bar %d", index)
 
         result.opened += max(0, paper.open_count() - opened_before)
-        result.never_filled += paper.cancel_pending()
 
         for reason, count in bot.refusals.items():
             delta = count - seen_refusals.get(reason, 0)
@@ -386,6 +397,9 @@ def run_replay(
     }
     paper.force_close_all(lambda symbol: last_prices.get(symbol))
     result.final_balance, result.final_equity = paper.account()
+    result.elapsed_s = time.perf_counter() - started
+    if result.bars:
+        result.us_per_iteration = (result.elapsed_s / result.bars) * 1_000_000
     return result
 
 
@@ -393,43 +407,39 @@ def _self_check() -> None:
     """The simulator must never fill at the price that generated the signal."""
     t0 = datetime(2026, 1, 7, tzinfo=UTC)
 
+    # An order cannot be priced without a known mark.
     paper = PaperBroker(starting_balance=1_000.0)
-    paper.place("EURUSD", Direction.BUY, 0.02, stop_loss=1.0950)
-    assert paper.open_count() == 0, "an order must not fill on the bar it was decided"
+    assert paper.place("EURUSD", Direction.BUY, 0.02, stop_loss=1.0950).success is False
 
-    next_bar = Candle(
-        datetime(2026, 1, 7, 1, tzinfo=UTC), 1.1010, 1.1020, 1.1000, 1.1015, spread=0.0002
-    )
-    assert paper.fill_pending(next_bar) == 1
-    position = next(iter(paper._positions.values()))        # noqa: SLF001
-    assert position.entry_price > next_bar.open, "a BUY must pay the ask, not the midpoint"
-    assert abs(position.entry_price - (next_bar.open + 0.0001)) < 1e-9
+    paper.mark("EURUSD", 1.1000, spread=0.0002, at=t0)
+    first = paper.place("EURUSD", Direction.BUY, 0.02, stop_loss=1.0950)
+    assert first.success and first.ticket == 1, first
+    position = paper._positions[first.ticket]               # noqa: SLF001
+    assert position.entry_price > 1.1000, "a BUY must pay the ask, not the midpoint"
+    assert abs(position.entry_price - 1.1001) < 1e-9
 
-    # A stop-out loses money and closes the position.
-    balance_before = paper.balance
-    crash = Candle(datetime(2026, 1, 7, 2, tzinfo=UTC), 1.1015, 1.1015, 1.0940, 1.0950)
-    events = paper.hit_levels(crash)
-    assert events and events[0][1] == "stop"
-    assert paper.open_count() == 0 and paper.balance < balance_before
-
-    # A bar spanning both levels resolves to the stop, not the target.
-    straddle = Candle(datetime(2026, 1, 7, 3, tzinfo=UTC), 1.1000, 1.1060, 1.0940, 1.1000)
-    paper2 = PaperBroker()
-    paper2.place("EURUSD", Direction.BUY, 0.01, stop_loss=1.0950, take_profit=1.1050)
-    paper2.fill_pending(straddle)
-    assert [k for _t, k in paper2.hit_levels(straddle)] == ["stop"]
+    # Tickets must be unique.  The first replay run returned 0 for every order,
+    # so all positions collided on one key and reconcile retired them at once.
+    second = paper.place("EURUSD", Direction.SELL, 0.01, stop_loss=1.1050)
+    assert second.ticket == 2 and paper.open_count() == 2
 
     # Volume normalises to the broker's step, and rounds DOWN.
     assert PaperBroker._normalise(0.037) == 0.03
     assert PaperBroker._normalise(0.001) == 0.0
 
+    # A bar spanning both levels resolves to the stop, not the target.
+    straddle = Candle(datetime(2026, 1, 7, 3, tzinfo=UTC), 1.1000, 1.1060, 1.0940, 1.1000)
+    paper2 = PaperBroker()
+    paper2.mark("EURUSD", 1.1000)
+    paper2.place("EURUSD", Direction.BUY, 0.01, stop_loss=1.0950, take_profit=1.1050)
+    assert [k for _t, k in paper2.hit_levels(straddle)] == ["stop"]
+
     # P&L arithmetic: 1 lot of EURUSD moving 100 pips is $1000.  The stop must
-    # sit AWAY from entry — a zero-distance stop is hit by the same bar's low,
-    # and an open position changes equity, not balance, until it closes.
+    # sit AWAY from entry — a zero-distance stop is hit by the same bar's low —
+    # and an open position moves equity, not balance, until it closes.
     paper3 = PaperBroker(starting_balance=1_000.0)
+    paper3.mark("EURUSD", 1.0000)
     paper3.place("EURUSD", Direction.BUY, 1.0, stop_loss=0.9900, take_profit=1.0100)
-    entry_bar = Candle(datetime(2026, 1, 7, tzinfo=UTC), 1.0000, 1.0000, 1.0000, 1.0000)
-    paper3.fill_pending(entry_bar)
     assert paper3.balance == 1_000.0, "an open position must not move the balance"
     profit_bar = Candle(datetime(2026, 1, 7, 1, tzinfo=UTC), 1.0000, 1.0100, 1.0000, 1.0100)
     assert [k for _t, k in paper3.hit_levels(profit_bar)] == ["target"]

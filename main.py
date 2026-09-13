@@ -39,6 +39,7 @@ SELF_CHECK_MODULES = (
     "tradebot.intake",
     "tradebot.supervise",
     "tradebot.replay",
+    "tradebot.dashboard",
     "tradebot.run",
 )
 
@@ -257,6 +258,35 @@ def cmd_replay(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """Serve the live monitor and keep trading alongside it.
+
+    The dashboard is a view of the running bot, not a separate mode: if it were
+    separate you would be watching something other than what trades.
+    """
+    import webbrowser
+
+    from tradebot.config import load_settings
+    from tradebot.dashboard import serve
+    from tradebot.run import Bot
+
+    bot = Bot(
+        load_settings(),
+        strategy=args.strategy,
+        interval_seconds=args.interval,
+        dry_run=args.dry_run,
+    )
+    serve(bot, host=args.host, port=args.port)
+    url = f"http://{args.host}:{args.port}"
+    print(f"Dashboard: {url}")
+    if not args.no_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:                                      # noqa: BLE001
+            pass
+    return bot.run()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="main.py", description="TradeBot")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -288,6 +318,13 @@ def build_parser() -> argparse.ArgumentParser:
     measure.add_argument("--strategy", default="", help="comma-separated; blank = all")
     measure.add_argument("--symbols", default="")
     measure.set_defaults(func=cmd_measure)
+
+    dash = sub.add_parser("dashboard", help="trade plus a live browser monitor")
+    add_trading_flags(dash)
+    dash.add_argument("--host", default="127.0.0.1")
+    dash.add_argument("--port", type=int, default=8787)
+    dash.add_argument("--no-browser", action="store_true")
+    dash.set_defaults(func=cmd_dashboard)
 
     replay = sub.add_parser("replay", help="drive the real bot over historical data")
     replay.add_argument("--strategy", default="mean_reversion")
