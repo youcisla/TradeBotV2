@@ -158,8 +158,17 @@ def simulate(
     *,
     max_hold: int = MAX_HOLD_BARS,
     pessimistic: bool = True,
+    breakeven: bool = False,
+    market_entry: bool = False,
 ) -> SimTrade:
-    """Resolve one signal into one position, net of spread and commission."""
+    """Resolve one signal into one position, net of spread and commission.
+
+    ``breakeven`` and ``market_entry`` default off, so this reports what it
+    always reported.  They exist to size the gap between this engine and
+    :mod:`tradebot.replay`, which fills at market and trails the stop to entry
+    after the first target.  Leaving either on for a reported number would
+    measure a strategy nobody runs.
+    """
     trade = SimTrade(
         symbol=signal.symbol,
         strategy=signal.strategy,
@@ -175,41 +184,60 @@ def simulate(
         trade.outcome = Outcome.INVALID
         return trade
 
-    sspec = symbol_spec(signal.symbol)
-    # Costs in R, so they scale with the trade's own risk rather than being a
-    # fixed drag that flatters tight stops.
-    spread_cost_r = (future[0].spread or 0.0) / r_dist
-    commission_r = sspec.round_trip_commission(1.0) / max(sspec.contract_size * r_dist, 1e-12)
-
     is_buy = signal.direction.is_buy
+    sspec = symbol_spec(signal.symbol)
     entry, stop = signal.entry_price, signal.stop_loss
     targets = trade.targets
     fractions = _splits(len(targets))
 
+    spread_cost_r = 0.0
+    commission_r = 0.0
     filled = False
     remaining = 1.0
     realised = 0.0
     hit = 0
     last = 0
 
+    def stop_r() -> float:
+        """What the remaining size returns if the current stop is reached."""
+        return ((stop - entry) / r_dist) if is_buy else ((entry - stop) / r_dist)
+
     for i, candle in enumerate(future[:max_hold]):
         high, low = candle.high, candle.low
         last = i + 1
 
         if not filled:
-            touched = (low <= entry) if is_buy else (high >= entry)
-            if not touched:
-                continue
+            if market_entry:
+                # A market order takes the next bar's open, because the decision
+                # was made on the previous one.  Nothing has to be touched —
+                # which is exactly why this model takes trades the limit model
+                # never records, and why the two engines disagree.
+                entry = candle.open
+            else:
+                touched = (low <= entry) if is_buy else (high >= entry)
+                if not touched:
+                    continue
             filled = True
             trade.filled = True
+            trade.entry = entry
+            r_dist = abs(entry - stop)
+            if r_dist <= 0:
+                trade.outcome = Outcome.INVALID
+                return trade
+            # Costs in R, so they scale with the trade's own risk rather than
+            # being a fixed drag that flatters tight stops.
+            spread_cost_r = (future[0].spread or 0.0) / r_dist
+            commission_r = sspec.round_trip_commission(1.0) / max(
+                sspec.contract_size * r_dist, 1e-12
+            )
 
         stop_hit = (low <= stop) if is_buy else (high >= stop)
 
         # Intrabar order is not recoverable from OHLC.  Default: the stop got
         # there first.  Assuming the opposite flatters every result.
         if pessimistic and stop_hit:
-            return _close(trade, realised - remaining, spread_cost_r, commission_r,
-                          Outcome.SL, last)
+            return _close(trade, realised + remaining * stop_r(), spread_cost_r,
+                          commission_r, Outcome.SL, last)
 
         while hit < len(targets):
             target = targets[hit]
@@ -224,9 +252,18 @@ def simulate(
         if remaining <= 1e-9:
             return _close(trade, realised, spread_cost_r, commission_r, Outcome.TP, last)
 
-        if stop_hit:
-            return _close(trade, realised - remaining, spread_cost_r, commission_r,
-                          Outcome.SL, last)
+        if breakeven and hit >= 1:
+            # What the bot does once the first target banks: the stop moves to
+            # entry and the remainder can no longer lose.  Unmodelled by
+            # default, and the largest single difference between the engines.
+            stop = entry
+
+        # Re-tested rather than reusing stop_hit: a moved stop has to be judged
+        # against this bar as it now stands.
+        stop_after = (low <= stop) if is_buy else (high >= stop)
+        if stop_after:
+            return _close(trade, realised + remaining * stop_r(), spread_cost_r,
+                          commission_r, Outcome.SL, last)
 
     if not filled:
         trade.outcome = Outcome.NO_FILL
@@ -334,8 +371,11 @@ def run_series(
     *,
     window: int = WINDOW,
     max_hold: int = MAX_HOLD_BARS,
+    horizon: int | None = None,
     cooldown: int = COOLDOWN_BARS,
     pessimistic: bool = True,
+    breakeven: bool = False,
+    market_entry: bool = False,
 ) -> list[SimTrade]:
     """Walk one symbol forward, resolving a position per signal.
 
@@ -343,7 +383,14 @@ def run_series(
     to ``i-1`` and trades into bar ``i`` and beyond.
     """
     h1 = list(series.get("H1") or [])
-    if len(h1) < window + max_hold + 2:
+
+    # ``horizon`` bounds how late a decision may be made; ``max_hold`` bounds how
+    # long the resulting position may run.  They are usually the same, and tying
+    # them together meant "let winners run" could only be tested by also moving
+    # the last decision point, which changes the sample instead of the rule.
+    if horizon is None:
+        horizon = max_hold
+    if len(h1) < window + horizon + 2:
         logger.warning("%s: only %d H1 bars — skipping", symbol, len(h1))
         return []
 
@@ -351,7 +398,7 @@ def run_series(
     trades: list[SimTrade] = []
     last_signal = -10_000
 
-    for i in range(window, len(h1) - max_hold):
+    for i in range(window, len(h1) - horizon):
         if i - last_signal < cooldown:
             continue
         cutoff = h1[i - 1].timestamp
@@ -377,8 +424,11 @@ def run_series(
 
         last_signal = i
         trades.append(
-            simulate(signal, cutoff, h1[i: i + max_hold + 1],
-                     max_hold=max_hold, pessimistic=pessimistic)
+            simulate(
+                signal, cutoff, h1[i:],
+                max_hold=max_hold, pessimistic=pessimistic,
+                breakeven=breakeven, market_entry=market_entry,
+            )
         )
     return trades
 
