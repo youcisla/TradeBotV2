@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tradebot"
+version = "0.1.0"
+description = "Autonomous MT5 trading bot — measurement first, automation second"
+readme = "README.md"
+# MetaTrader5 publishes wheels only up to Python 3.13. The upper bound is not
+# cosmetic: on 3.14 the broker package cannot be installed at all, so the whole
+# live path is unreachable.
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "MetaTrader5>=5.0.45",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["tradebot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+disallow_untyped_defs = true

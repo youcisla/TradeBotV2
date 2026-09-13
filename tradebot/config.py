@@ -114,6 +114,29 @@ class Settings:
         """True when real capital is at risk.  Demo is the safe default."""
         return not self.demo_mode
 
+    def validate(self, *, require_broker: bool = True) -> None:
+        """Fail closed at the boundary instead of deferring the failure.
+
+        Called at startup.  Missing credentials must stop the process with a
+        clear message, not surface three layers down as an opaque IPC error
+        once the loop is already running and positions may exist.
+        """
+        if require_broker and not self.broker.configured:
+            missing = [
+                name
+                for name, value in (
+                    ("BROKER_ACCOUNT", self.broker.account),
+                    ("BROKER_PASSWORD", self.broker.password),
+                    ("BROKER_SERVER", self.broker.server),
+                )
+                if not value
+            ]
+            raise RuntimeError(
+                f"broker credentials missing: {', '.join(missing)} — set them in .env"
+            )
+        if not self.symbols:
+            raise RuntimeError("symbol universe is empty")
+
 
 def load_settings() -> Settings:
     return Settings.from_env()

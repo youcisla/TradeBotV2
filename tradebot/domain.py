@@ -52,6 +52,12 @@ class Outcome(StrEnum):
     SL = "SL"
     TIMEOUT = "TIMEOUT"
     MANUAL = "MANUAL"
+    # A limit entry that price never returned to.  Not a loss and not a win —
+    # it consumed no capital and must be counted separately, because folding it
+    # into either bucket distorts both the win rate and the expectancy.
+    NO_FILL = "NO_FILL"
+    # Rejected before entry: bad geometry, failed a guard, or sized to zero.
+    INVALID = "INVALID"
 
 
 @dataclass(frozen=True, slots=True)
