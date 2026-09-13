@@ -38,8 +38,11 @@ SELF_CHECK_MODULES = (
     "tradebot.state",
     "tradebot.intake",
     "tradebot.supervise",
+    "tradebot.replay",
     "tradebot.run",
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _configure_logging(verbose: bool = False) -> None:
@@ -193,6 +196,67 @@ def cmd_check(_: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def cmd_replay(args: argparse.Namespace) -> int:
+    """Drive the REAL bot over historical data — no orders reach the broker.
+
+    History is fetched from MT5 once, then the bot runs against a cursor and a
+    simulated broker.  Every rule the live bot enforces is enforced here, so
+    this answers "would the bot have traded, and what would it have done?"
+    rather than "is the strategy profitable?".
+    """
+    from tradebot.config import load_settings
+    from tradebot.data import MarketData
+    from tradebot.replay import run_replay
+    from tradebot.run import Bot
+
+    settings = load_settings()
+    settings.validate(require_broker=True)
+    # Replay must never touch live state.
+    settings.state_dir = REPO_ROOT / "state" / "replay"
+
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()] or list(settings.symbols)
+    settings.symbols = tuple(symbols)
+
+    data = MarketData(settings)
+    if not data.connect():
+        logger.error("MT5 is required to fetch history for a replay")
+        return 1
+    series: dict[str, list] = {}
+    try:
+        for symbol in symbols:
+            candles = data.candles(symbol, "H1", args.candles)
+            if len(candles) >= args.start + 10:
+                series[symbol] = candles
+            else:
+                logger.warning("%s: only %d bars — skipping", symbol, len(candles))
+    finally:
+        data.disconnect()
+
+    if not series:
+        logger.error("no usable history fetched")
+        return 1
+
+    bot = Bot(settings, strategy=args.strategy, interval_seconds=0.0)
+    result = run_replay(bot, series, start=args.start, stride=args.stride)
+
+    print()
+    print(
+        f"REPLAY — strategy '{args.strategy}' over {len(series)} symbol(s), "
+        f"{args.candles} H1 bars"
+    )
+    print("-" * 108)
+    print(result.render())
+    print()
+    print(
+        "This exercises the bot's own logic (risk envelope, sizing, partials,\n"
+        "breakeven, reconciliation).  It is not a profitability measure — use\n"
+        "'main.py measure' for that, and treat neither as a substitute for a\n"
+        "forward test on the demo account."
+    )
+    print()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="main.py", description="TradeBot")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -224,6 +288,14 @@ def build_parser() -> argparse.ArgumentParser:
     measure.add_argument("--strategy", default="", help="comma-separated; blank = all")
     measure.add_argument("--symbols", default="")
     measure.set_defaults(func=cmd_measure)
+
+    replay = sub.add_parser("replay", help="drive the real bot over historical data")
+    replay.add_argument("--strategy", default="mean_reversion")
+    replay.add_argument("--symbols", default="")
+    replay.add_argument("--candles", type=int, default=5000, help="H1 bars to fetch")
+    replay.add_argument("--start", type=int, default=200, help="first bar index to act on")
+    replay.add_argument("--stride", type=int, default=1, help="bars advanced per step")
+    replay.set_defaults(func=cmd_replay)
 
     sub.add_parser("stop", help="set the kill switch").set_defaults(func=cmd_stop)
     sub.add_parser("clear", help="clear the kill switch").set_defaults(func=cmd_clear)

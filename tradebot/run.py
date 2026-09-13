@@ -70,6 +70,9 @@ class Bot:
         self.state = StateStore(settings.state_dir)
         self.trades: dict[int, Trade] = {}
         self.iteration = 0
+        # Why trades were refused, by reason.  Exposed so a replay reports the
+        # distribution rather than merely "nothing happened".
+        self.refusals: dict[str, int] = {}
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -317,6 +320,11 @@ class Bot:
 
     # ── entry ────────────────────────────────────────────────────────────────
 
+    def _note_refusal(self, reason: str) -> None:
+        """Bucket a refusal by its leading clause so the counts aggregate."""
+        key = reason.split("(")[0].split(":")[0].strip()[:48] or "unknown"
+        self.refusals[key] = self.refusals.get(key, 0) + 1
+
     def _current_spread(self, symbol: str) -> float:
         recent = self.data.candles(symbol, "H1", 2)
         return recent[-1].spread if recent else 0.0
@@ -330,11 +338,13 @@ class Bot:
         )
         if not allowed:
             logger.info("Refused %s %s: %s", signal.direction, signal.symbol, reason)
+            self._note_refusal(reason)
             return False
 
         volume = position_size(signal, equity, RISK)
         if volume <= 0:
             logger.info("Refused %s: sizes to zero at this equity", signal.symbol)
+            self._note_refusal("size rounds to zero")
             return False
 
         if self.dry_run:
