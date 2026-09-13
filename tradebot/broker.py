@@ -369,8 +369,11 @@ def _self_check() -> None:
     assert normalize_volume("NOPE", -1.0) == 0.0
     # A partial never exceeds what is open.
     assert partial_volume("NOPE", 99.0, 0.5) <= 0.5
-    # Comments are stripped to ASCII and truncated.
-    assert _safe_comment("héllo wörld") == "hello world"
+    # Non-ASCII is DROPPED, not transliterated: "é" and "ö" vanish rather than
+    # becoming "e" and "o".  MT5 rejects non-ASCII either way and the comment
+    # is cosmetic, so dropping is correct — worth asserting so nobody later
+    # "fixes" it into a transliteration dependency.
+    assert _safe_comment("héllo wörld") == "hllo wrld", _safe_comment("héllo wörld")
     assert len(_safe_comment("x" * 100)) == 29
     assert _safe_comment("") == "tradebot"
     print("broker.py self-check: OK")

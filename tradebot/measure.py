@@ -408,21 +408,41 @@ def evaluate(
         key=lambda t: t.opened_at,
     )
     results["pooled"] = compute_metrics(pooled, label="POOLED", risk_fraction=risk_fraction)
+    if not pooled:
+        return results
 
-    if folds > 1 and pooled:
-        size = max(1, len(pooled) // folds)
+    cut = int(len(pooled) * (1.0 - holdout_fraction))
+    exploration, holdout = pooled[:cut], pooled[cut:]
+
+    # Folds are drawn ONLY from the exploration window.  Drawing them from the
+    # whole series made the final fold and the holdout the same bars, so they
+    # appeared to confirm each other when they were one observation counted
+    # twice.
+    if folds > 1 and exploration:
+        size = max(1, len(exploration) // folds)
         for i in range(folds):
-            chunk = pooled[i * size: (i + 1) * size]
+            chunk = exploration[i * size: (i + 1) * size]
             if chunk:
                 results[f"fold{i + 1}"] = compute_metrics(
                     chunk, label=f"fold {i + 1}", risk_fraction=risk_fraction
                 )
 
-    if pooled:
-        cut = int(len(pooled) * (1.0 - holdout_fraction))
+    if holdout:
         results["holdout"] = compute_metrics(
-            pooled[cut:], label="HOLDOUT", risk_fraction=risk_fraction
+            holdout, label="HOLDOUT", risk_fraction=risk_fraction
         )
+
+    # Calendar buckets.  A strategy whose edge exists in one recent window and
+    # nowhere else has not been validated — it has been discovered, which is a
+    # much weaker claim.  Splitting by year makes the difference visible.
+    by_year: dict[int, list[SimTrade]] = {}
+    for trade in pooled:
+        by_year.setdefault(trade.opened_at.year, []).append(trade)
+    for year in sorted(by_year):
+        results[f"year{year}"] = compute_metrics(
+            by_year[year], label=str(year), risk_fraction=risk_fraction
+        )
+
     return results
 
 
