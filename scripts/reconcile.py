@@ -39,7 +39,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger("reconcile")
 
-RULE = "-" * 104
+# Columns are pipe-separated on purpose.  A fixed-width table leans on long runs
+# of spaces, and those do not survive a terminal, a narrow console, or a paste —
+# they collapse, and "382       0" starts reading as "3820".  A one-character
+# separator cannot be eaten.
+_COLUMNS: tuple[tuple[str, int, str], ...] = (
+    ("variant", 34, "<"),
+    ("n", 5, ">"),
+    ("nofill", 6, ">"),
+    ("win", 7, ">"),
+    ("avgR", 8, ">"),
+    ("PF", 6, ">"),
+    ("maxDD", 7, ">"),
+)
+RULE = "-" * (sum(width for _, width, _ in _COLUMNS) + 3 * (len(_COLUMNS) - 1))
+
+
+def _row(cells: tuple[str, ...]) -> str:
+    return " | ".join(
+        f"{text:{align}{width}}" for text, (_, width, align) in zip(cells, _COLUMNS)
+    ).rstrip()
 
 # One difference at a time, then every difference we know of at once.  The
 # order is for reading, not for arithmetic: these are independent runs, not a
@@ -111,7 +130,7 @@ def main() -> int:
     print(f"symbols: {', '.join(history)}   bars: {args.candles} H1   "
           f"strategy: mean_reversion   intrabar: pessimistic")
     print(RULE)
-    print(f"{'variant':<34}{'n':>6}{'nofill':>8}{'win':>8}{'avgR':>9}{'PF':>7}{'maxDD':>8}")
+    print(_row(tuple(name for name, _, _ in _COLUMNS)))
     print(RULE)
 
     for label, flags in VARIANTS:
@@ -123,9 +142,15 @@ def main() -> int:
         pooled = evaluate(per_symbol, risk_fraction=RISK.risk_per_trade)["pooled"]
         pf = "inf" if pooled.profit_factor == float("inf") else f"{pooled.profit_factor:.2f}"
         print(
-            f"{label:<34}{pooled.positions:>6}{pooled.no_fills:>8}"
-            f"{pooled.win_rate:>8.1%}{pooled.avg_r:>+9.3f}{pf:>7}"
-            f"{pooled.max_drawdown:>8.1%}"
+            _row((
+                label,
+                str(pooled.positions),
+                str(pooled.no_fills),
+                f"{pooled.win_rate:.1%}",
+                f"{pooled.avg_r:+.3f}",
+                pf,
+                f"{pooled.max_drawdown:.1%}",
+            ))
         )
 
     # The replay's own ledger, scored the same way.  Average R is per-trade and
@@ -135,11 +160,18 @@ def main() -> int:
     print(RULE)
     if n:
         print(
-            f"{'REPLAY LEDGER (actual record)':<34}{n:>6}{'-':>8}"
-            f"{win:>8.1%}{avg_r:>+9.3f}{pf:>7.2f}{'-':>8}"
+            _row((
+                "REPLAY LEDGER (actual record)",
+                str(n),
+                "-",
+                f"{win:.1%}",
+                f"{avg_r:+.3f}",
+                f"{pf:.2f}",
+                "-",
+            ))
         )
     else:
-        print(f"{'REPLAY LEDGER (actual record)':<34}{'empty — run main.py replay':>50}")
+        print("REPLAY LEDGER (actual record): empty — run `python main.py replay` first")
     print(RULE)
 
     print()
