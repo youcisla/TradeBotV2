@@ -43,7 +43,12 @@ _load_dotenv()
 class RiskEnvelope:
     """Hard limits no code path may exceed at runtime."""
 
-    risk_per_trade: float = 0.01          # 1% of equity risked per position
+    # Sized to the account's tolerance rather than the other way round. The
+    # measured mean-reversion drawdown is ~31% at 1% risk, which would trip the
+    # 20% halt during the very period it was profitable; at 0.5% the same curve
+    # draws down ~16% and fits. Raising max_drawdown instead would have been
+    # raising the limit to fit the trade — the one move that must never be easy.
+    risk_per_trade: float = 0.005         # 0.5% of equity risked per position
     max_daily_loss: float = 0.05          # halt new entries for the day
     max_drawdown: float = 0.20            # stop everything, require a human
     max_concurrent_positions: int = 5

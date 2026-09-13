@@ -125,7 +125,10 @@ class RiskManager:
             return False, f"bad geometry: {error}"
 
         reward_risk = self._reward_risk(signal)
-        if reward_risk < self.envelope.min_reward_risk:
+        # Tolerance is not cosmetic.  A 50-pip stop against a 50-pip target
+        # computes to 0.9999999999999778 in IEEE-754, so a bare `< 1.0` test
+        # rejects genuine 1:1 trades on floating-point error alone.
+        if reward_risk < self.envelope.min_reward_risk - 1e-9:
             return False, (
                 f"reward:risk {reward_risk:.2f} below {self.envelope.min_reward_risk:.2f}"
             )
@@ -178,10 +181,10 @@ def _self_check() -> None:
 
     # Use an equity small enough that the absolute lot ceiling does not bind,
     # so these assertions test the sizing formula rather than the clamp.
-    # 1% of 2,000 is 20. A 50-pip stop on EURUSD is $500/lot -> 0.04 lots.
-    assert abs(position_size(sig(1.0950), 2_000.0) - 0.04) < 1e-9
+    # 0.5% of 2,000 is 10. A 50-pip stop on EURUSD is $500/lot -> 0.02 lots.
+    assert abs(position_size(sig(1.0950), 2_000.0) - 0.02) < 1e-9
     # A stop twice as wide risks the same money in half the size.
-    assert abs(position_size(sig(1.0900), 2_000.0) - 0.02) < 1e-9
+    assert abs(position_size(sig(1.0900), 2_000.0) - 0.01) < 1e-9
     # Volatility does not change the money at risk — that is the whole point.
     assert abs(
         position_size(sig(1.0950), 2_000.0) * 0.0050 * 100_000
