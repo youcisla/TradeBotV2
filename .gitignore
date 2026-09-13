@@ -1,0 +1,39 @@
+# Secrets — never commit.  `.env` holds broker credentials.
+*.env
+.env
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# Runtime state (heartbeats, kill switch, measurement artifacts)
+state/
+*.log
+logs/
+
+# Backtest caches
+.backtest_cache/
+*.pkl
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+.vercel/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
