@@ -1,5 +1,15 @@
 # TradeBot
 
+> **Stage 2 of 3 — superseded, kept as the pivot.**
+>
+> Written 13 September 2026, the day the previous system was found to have no
+> measurable edge and no working live path. One premise survived into the
+> current work: **nothing is built on a strategy that has not survived an
+> out-of-sample test with real costs.**
+>
+> ← Stage 1: [TradeBot](https://github.com/youcisla/TradeBot) ·
+> → Stage 3, current: [Zero-Trust-Trader](https://github.com/youcisla/Zero-Trust-Trader)
+
 A rebuild from scratch. The previous codebase is preserved on the
 `legacy/pre-rebuild-2026-09-13` branch of `github.com/youcisla/TradeBot`, and
 locally as `TradeBot_legacy_2026-09-13.zip` and
@@ -70,6 +80,17 @@ tests/
 
 ## Status
 
-Foundation laid: `config.py`, `domain.py`. Everything else is still to build,
-in the order listed above — measurement before strategy, strategy before
-execution.
+20 modules, **69 passing tests**:
+
+```bash
+uv run --with pytest pytest tests -q
+```
+
+`measure.py` is the only path a number can earn trust through: as-of slicing,
+real spread and commission on every fill, per-position R, and a time-frozen
+holdout. `agents.py` declares capabilities with **no order capability at all**,
+so an analyst cannot reach the broker by construction rather than by prompt.
+
+Superseded in November 2026 by [Zero-Trust-Trader](https://github.com/youcisla/Zero-Trust-Trader), which keeps this
+premise and adds cumulative trial accounting, permutation tests, a
+tamper-evident ledger and consent gates that fail closed.
